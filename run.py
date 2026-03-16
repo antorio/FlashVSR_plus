@@ -63,7 +63,7 @@ root = os.path.dirname(os.path.abspath(__file__))
 temp = os.path.join(root, "_temp")
 devices = get_device_list()
 
-def model_downlod(model_name="JunhaoZhuang/FlashVSR"):
+def model_downlod(model_name="JunhaoZhuang/FlashVSR-v1.1"):
     model_dir = os.path.join(root, "models", model_name.split("/")[-1])
     if not os.path.exists(model_dir):
         log(f"Downloading model '{model_name}' from huggingface...", message_type='info')
