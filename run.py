@@ -362,7 +362,7 @@ def tile_LQ_generator(path, x1, y1, x2, y2, scale, dtype, F):
                 tile_np = frame_np[y1:y2, x1:x2, :]
 
             frame_tensor = torch.from_numpy(tile_np).to(dtype)
-            # compute tH,tW for this tile dims (done outside would be more optimal)
+            # compute tH,tW for this tile dims
             h_tile = tile_np.shape[0]
             w_tile = tile_np.shape[1]
             _, _, tW, tH = compute_scaled_and_target_dims(w_tile, h_tile, scale=scale, multiple=128)
@@ -522,7 +522,7 @@ def stitch_video_tiles(
     fps, 
     quality, 
     cleanup=True,
-    chunk_size=40  # --- 新增参数：每次在内存中处理的帧数 ---
+    chunk_size=40  # --- 新参数：每次在内存中处理的帧数 ---
 ):
     if not tile_paths:
         log("No tile videos found to stitch.", message_type='error')
@@ -530,21 +530,18 @@ def stitch_video_tiles(
     
     final_W, final_H = final_dims
     
-    # 1. 一次性打开 semua video files
+    # Open all readers
     readers = [imageio.get_reader(p) for p in tile_paths]
     
     try:
-        # 获取总帧数
         num_frames = readers[0].count_frames()
         if num_frames is None or num_frames <= 0:
             num_frames = len([_ for _ in readers[0]])
             for r in readers: r.close()
             readers = [imageio.get_reader(p) for p in tile_paths]
             
-        # 打开最终的写入器
         with imageio.get_writer(output_path, fps=fps, quality=quality) as writer:
             
-            # 2. 按 chunk_size 遍历所有帧
             for start_frame in tqdm(range(0, num_frames, chunk_size), desc="[FlashVSR] Stitching Chunks"):
                 end_frame = min(start_frame + chunk_size, num_frames)
                 current_chunk_size = end_frame - start_frame
@@ -575,7 +572,7 @@ def stitch_video_tiles(
                     mask[:, -overlap*scale:, :] *= np.flip(ramp)[np.newaxis, :, np.newaxis]
                     mask[:overlap*scale, :, :] *= ramp[:, np.newaxis, np.newaxis]
                     mask[-overlap*scale:, :, :] *= np.flip(ramp)[:, np.newaxis, np.newaxis]
-                    mask_4d = mask[np.newaxis, :, :, :] # 形状: (1, H, W, C)
+                    mask_4d = mask[np.newaxis, :, :, :] # (1,H,W,C)
                     
                     x1_orig, y1_orig, _, _ = tile_coords[i]
                     out_y1, out_x1 = y1_orig * scale, x1_orig * scale
@@ -697,7 +694,6 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         # For tiled processing we need H,W from frames (non streaming) or from streaming metadata
         if mode == "tiny-long":
             N = frame_count
-            # h0,w0 are from prepare_tensors_stream
             H = h0
             W = w0
         else:
@@ -732,13 +728,8 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
                 LQ_tile = tile_LQ_generator(input, x1, y1, x2, y2, scale=scale, dtype=dtype, F=F)
             else:
                 input_tile = frames[:, y1:y2, x1:x2, :]
-                if mode == "tiny-long":
-                    # (this branch won't be hit because handled above)
-                    th, tw, F = get_input_params(input_tile, scale=scale)
-                    LQ_tile = input_tensor_generator(input_tile, _device, scale=scale, dtype=dtype)
-                else:
-                    LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
-                    LQ_tile = LQ_tile.to(_device)
+                LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
+                LQ_tile = LQ_tile.to(_device)
             
             if i == 0:
                 log(f"[FlashVSR] Processing {frame_count} frames...", message_type='info')
@@ -753,9 +744,7 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             
             temp_videos.append(temp_name)
             if mode == "tiny-long":
-                # in this mode output_tile_gpu is already the final tile video path or tensor depending implementation
-                final_output = output_tile_gpu
-                # free what we can and continue
+                # pipeline writes per-tile files to temp_name
                 try:
                     del LQ_tile
                 except Exception:
@@ -772,20 +761,40 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
             out_x1, out_y1 = x1 * scale, y1 * scale
             
+            # safe placement: slice to intersection sizes so shapes always match
             tile_H_scaled = processed_tile_cpu.shape[1]
             tile_W_scaled = processed_tile_cpu.shape[2]
-            out_x2, out_y2 = out_x1 + tile_W_scaled, out_y1 + tile_H_scaled
-            final_output_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += processed_tile_cpu * mask_nhwc
-            weight_sum_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += mask_nhwc
+            canvas_H = final_output_canvas.shape[1]
+            canvas_W = final_output_canvas.shape[2]
+            y_end = min(out_y1 + tile_H_scaled, canvas_H)
+            x_end = min(out_x1 + tile_W_scaled, canvas_W)
+            h_use = y_end - out_y1
+            w_use = x_end - out_x1
+            if h_use <= 0 or w_use <= 0:
+                log(f"Warning: computed placement for tile {i+1} is out of canvas bounds; skipping.", message_type='warning')
+                del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile
+                clean_vram()
+                continue
+            
+            tile_slice = processed_tile_cpu[:, :h_use, :w_use, :]
+            mask_slice = mask_nhwc[:, :h_use, :w_use, :]
+            final_output_canvas[:, out_y1:y_end, out_x1:x_end, :] += tile_slice * mask_slice
+            weight_sum_canvas[:, out_y1:y_end, out_x1:x_end, :] += mask_slice
             
             del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile
             clean_vram()
         
         if mode == "tiny-long":
+            # stitch temp tile videos -> single final file
             stitch_video_tiles(tile_paths=temp_videos, tile_coords=tile_coords, final_dims=(W * scale, H * scale),
                 scale=scale, overlap=tile_overlap, output_path=output, fps=_fps, quality=quality, cleanup=True
             )
-            shutil.rmtree(local_temp)
+            try:
+                shutil.rmtree(local_temp)
+            except Exception:
+                pass
+            # for tiny-long we return None as in original flow; output file already written to `output`
+            return None, _fps
         else:
             weight_sum_canvas[weight_sum_canvas == 0] = 1.0
             final_output = final_output_canvas / weight_sum_canvas
