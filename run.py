@@ -19,7 +19,7 @@ parser.add_argument("--seed", type=int, default=0, help="Random Seed, default=0"
 parser.add_argument("-t", "--dtype", type=str, default="bf16", choices=["fp16", "bf16"], help="Data type for processing, default=bf16")
 parser.add_argument("-d", "--device", type=str, default="auto", help="Device to run FlashVSR")
 parser.add_argument("-f", "--fps", type=int, default=30, help="Output FPS (for image sequences only), default=30")
-parser.add_argument("-q", "--quality", type=int, default=10, help="Output video quality, default=6")
+parser.add_argument("-q", "--quality", type=int, default=10, help="Output video quality, default=10")
 parser.add_argument("-a", "--attention", default="sage", choices=["sage", "block"], help="Attention mode, default=sage")
 parser.add_argument("output_folder", type=str, help="Path to save output video")
 args = parser.parse_args()
@@ -239,7 +239,7 @@ def prepare_tensors(path: str, dtype=torch.bfloat16):
 def prepare_tensors_stream(path: str, dtype=torch.bfloat16):
     """
     Open reader and return (fps, total_frames, h0, w0)
-    Reader is not returned because we'll open fresh readers per tile/generator to avoid random-access seeks.
+    Robust: sanitize metadata.nframes (handle inf/NaN) and fall back to counting.
     """
     if os.path.isdir(path):
         # images folder: count files and read first
@@ -250,7 +250,7 @@ def prepare_tensors_stream(path: str, dtype=torch.bfloat16):
             w0, h0 = _img0.size
         total = len(paths0)
         fps = 30
-        return fps, total, h0, w0
+        return fps, int(total), h0, w0
 
     if is_video(path):
         rdr = imageio.get_reader(path)
@@ -258,44 +258,72 @@ def prepare_tensors_stream(path: str, dtype=torch.bfloat16):
             meta = rdr.get_meta_data()
         except Exception:
             meta = {}
-        # try to get first frame dims without reading whole file
+
+        # get first frame dims without forcing a full read
         try:
             first_frame = rdr.get_data(0)
             h0, w0, _ = first_frame.shape
         except Exception:
-            # fallback: iterate one frame
+            # try one-step iterator fallback
             try:
                 it = rdr.iter_data()
                 first_frame = next(it)
                 h0, w0, _ = first_frame.shape
             except Exception as e:
-                rdr.close()
+                try:
+                    rdr.close()
+                except Exception:
+                    pass
                 raise RuntimeError(f"Cannot read first frame: {e}")
+
         fps_val = meta.get('fps', 30)
         fps = int(round(fps_val)) if isinstance(fps_val, (int, float)) else 30
 
+        # --- robust total frame detection ---
         total = meta.get('nframes', None)
-        if total is None or total <= 0:
-            # try count_frames (may be expensive but required if no metadata)
+
+        # attempt to coerce to float then check finiteness
+        try:
+            total_val = float(total) if total is not None else None
+        except Exception:
+            total_val = None
+
+        if total_val is None or (not math.isfinite(total_val)) or total_val <= 0:
+            # try count_frames (may be supported and fast)
             try:
-                total = rdr.count_frames()
+                total_count = rdr.count_frames()
+                total_val = float(total_count) if total_count is not None else None
             except Exception:
-                # expensive fallback: iterate quickly counting, but we try to avoid this in typical containers
-                total = None
-        rdr.close()
+                total_val = None
 
-        # if still None, attempt a safe counting pass (this is rare)
-        if total is None or total <= 0:
-            rdr2 = imageio.get_reader(path)
-            total = 0
-            for _ in rdr2.iter_data():
-                total += 1
-            rdr2.close()
+        if total_val is None or (not math.isfinite(total_val)) or total_val <= 0:
+            # final fallback: manual fast counting pass
+            try:
+                rdr2 = imageio.get_reader(path)
+                cnt = 0
+                for _ in rdr2.iter_data():
+                    cnt += 1
+                total_val = float(cnt)
+                try:
+                    rdr2.close()
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    rdr.close()
+                except Exception:
+                    pass
+                raise RuntimeError(f"Cannot determine frame count for {path}: {e}")
 
-        if total <= 0:
-            raise RuntimeError(f"Cannot determine frame count for {path}")
-
-        return fps, total, h0, w0
+        # sanitize and return
+        total_int = int(total_val)
+        try:
+            rdr.close()
+        except Exception:
+            pass
+        if total_int <= 0:
+            raise RuntimeError(f"Determined invalid frame count: {total_int}")
+        return fps, total_int, h0, w0
 
     raise ValueError(f"Unsupported input for streaming: {path}")
 
