@@ -19,7 +19,7 @@ parser.add_argument("--seed", type=int, default=0, help="Random Seed, default=0"
 parser.add_argument("-t", "--dtype", type=str, default="bf16", choices=["fp16", "bf16"], help="Data type for processing, default=bf16")
 parser.add_argument("-d", "--device", type=str, default="auto", help="Device to run FlashVSR")
 parser.add_argument("-f", "--fps", type=int, default=30, help="Output FPS (for image sequences only), default=30")
-parser.add_argument("-q", "--quality", type=int, default=6, help="Output video quality, default=6")
+parser.add_argument("-q", "--quality", type=int, default=10, help="Output video quality, default=10")
 parser.add_argument("-a", "--attention", default="sage", choices=["sage", "block"], help="Attention mode, default=sage")
 parser.add_argument("output_folder", type=str, help="Path to save output video")
 args = parser.parse_args()
