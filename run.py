@@ -147,7 +147,7 @@ def merge_video_with_audio(video_path, audio_source_path):
             try:
                 os.remove(temp)
             except OSError as e:
-                log(f"[FlashVSR] Could not remove temporary file '{temp}': {e}", message_type='error')
+                lgo(f"[FlashVSR] Could not remove temporary file '{temp}': {e}", message_type='error')
     
 def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128):
     if w0 <= 0 or h0 <= 0:
@@ -171,10 +171,6 @@ def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: 
     
     return cropped_tensor.squeeze(0)
 
-# ------------------------------
-# Original prepare_tensors (images + video)
-# kept for non streaming modes
-# ------------------------------
 def prepare_tensors(path: str, dtype=torch.bfloat16):
     if os.path.isdir(path):
         paths0 = list_images_natural(path)
@@ -233,195 +229,23 @@ def prepare_tensors(path: str, dtype=torch.bfloat16):
     
     raise ValueError(f"Unsupported input: {path}")
 
-# ------------------------------
-# New streaming helpers (for tiny-long)
-# ------------------------------
-def prepare_tensors_stream(path: str, dtype=torch.bfloat16):
-    """
-    Open reader and return (fps, total_frames, h0, w0)
-    Robust: sanitize metadata.nframes (handle inf/NaN) and fall back to counting.
-    """
-    if os.path.isdir(path):
-        # images folder: count files and read first
-        paths0 = list_images_natural(path)
-        if not paths0:
-            raise FileNotFoundError(f"No images in {path}")
-        with Image.open(paths0[0]) as _img0:
-            w0, h0 = _img0.size
-        total = len(paths0)
-        fps = 30
-        return fps, int(total), h0, w0
-
-    if is_video(path):
-        rdr = imageio.get_reader(path)
-        try:
-            meta = rdr.get_meta_data()
-        except Exception:
-            meta = {}
-
-        # get first frame dims without forcing a full read
-        try:
-            first_frame = rdr.get_data(0)
-            h0, w0, _ = first_frame.shape
-        except Exception:
-            # try one-step iterator fallback
-            try:
-                it = rdr.iter_data()
-                first_frame = next(it)
-                h0, w0, _ = first_frame.shape
-            except Exception as e:
-                try:
-                    rdr.close()
-                except Exception:
-                    pass
-                raise RuntimeError(f"Cannot read first frame: {e}")
-
-        fps_val = meta.get('fps', 30)
-        fps = int(round(fps_val)) if isinstance(fps_val, (int, float)) else 30
-
-        # --- robust total frame detection ---
-        total = meta.get('nframes', None)
-
-        # attempt to coerce to float then check finiteness
-        try:
-            total_val = float(total) if total is not None else None
-        except Exception:
-            total_val = None
-
-        if total_val is None or (not math.isfinite(total_val)) or total_val <= 0:
-            # try count_frames (may be supported and fast)
-            try:
-                total_count = rdr.count_frames()
-                total_val = float(total_count) if total_count is not None else None
-            except Exception:
-                total_val = None
-
-        if total_val is None or (not math.isfinite(total_val)) or total_val <= 0:
-            # final fallback: manual fast counting pass
-            try:
-                rdr2 = imageio.get_reader(path)
-                cnt = 0
-                for _ in rdr2.iter_data():
-                    cnt += 1
-                total_val = float(cnt)
-                try:
-                    rdr2.close()
-                except Exception:
-                    pass
-            except Exception as e:
-                try:
-                    rdr.close()
-                except Exception:
-                    pass
-                raise RuntimeError(f"Cannot determine frame count for {path}: {e}")
-
-        # sanitize and return
-        total_int = int(total_val)
-        try:
-            rdr.close()
-        except Exception:
-            pass
-        if total_int <= 0:
-            raise RuntimeError(f"Determined invalid frame count: {total_int}")
-        return fps, total_int, h0, w0
-
-    raise ValueError(f"Unsupported input for streaming: {path}")
-
-def get_input_params_from_dims(N0, h0, w0, scale):
-    """
-    Same as get_input_params but based on dims and total frames (for streaming).
-    """
+def get_input_params(image_tensor, scale):
+    N0, h0, w0, _ = image_tensor.shape
+    
     multiple = 128
     sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
     num_frames_with_padding = N0 + 4
     F = largest_8n1_leq(num_frames_with_padding)
+    
     if F == 0:
         raise RuntimeError(f"Not enough frames after padding. Got {num_frames_with_padding}.")
+    
     return tH, tW, F
-
-def tile_LQ_generator(path, x1, y1, x2, y2, scale, dtype, F):
-    """
-    Generator that yields processed LQ tensors for a tile region (CPU tensors).
-    Reads the video anew for this tile (so each tile has its own reader).
-    Yields F tensors (repeats last frame as padding if needed).
-    Each yielded tensor is shape (C, H, W) and already scaled/center-cropped and normalized to [-1,1].
-    """
-    rdr = imageio.get_reader(path)
-    last_frame_tensor = None
-    count = 0
-    try:
-        for frame_data in rdr.iter_data():
-            if count >= F:
-                break
-            # crop region
-            try:
-                tile_np = frame_data[y1:y2, x1:x2, :].astype(np.float32) / 255.0
-            except Exception:
-                # if indexing fails, fallback to whole frame then crop
-                frame_np = frame_data.astype(np.float32) / 255.0
-                tile_np = frame_np[y1:y2, x1:x2, :]
-
-            frame_tensor = torch.from_numpy(tile_np).to(dtype)
-            # compute tH,tW for this tile dims
-            h_tile = tile_np.shape[0]
-            w_tile = tile_np.shape[1]
-            _, _, tW, tH = compute_scaled_and_target_dims(w_tile, h_tile, scale=scale, multiple=128)
-            tensor_chw = tensor_upscale_then_center_crop(frame_tensor, scale=scale, tW=tW, tH=tH)
-            tensor_out = tensor_chw * 2.0 - 1.0
-            tensor_out = tensor_out.to('cpu').to(dtype)
-            last_frame_tensor = tensor_out
-            yield tensor_out
-            count += 1
-        # if fewer frames than F, repeat last_frame_tensor
-        while count < F:
-            if last_frame_tensor is None:
-                # no frames at all (shouldn't happen)
-                raise RuntimeError("No frames available to pad")
-            yield last_frame_tensor
-            count += 1
-    finally:
-        try:
-            rdr.close()
-        except Exception:
-            pass
-
-def global_LQ_generator(path, scale, dtype, F):
-    """
-    Generator that yields processed LQ tensors for the full frame (CPU tensors).
-    Yields exactly F tensors, repeating last frame as padding if needed.
-    """
-    rdr = imageio.get_reader(path)
-    last_frame_tensor = None
-    count = 0
-    try:
-        for frame_data in rdr.iter_data():
-            if count >= F:
-                break
-            frame_np = frame_data.astype(np.float32) / 255.0
-            frame_tensor = torch.from_numpy(frame_np).to(dtype)
-            h0, w0, _ = frame_np.shape
-            _, _, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=128)
-            tensor_chw = tensor_upscale_then_center_crop(frame_tensor, scale=scale, tW=tW, tH=tH)
-            tensor_out = tensor_chw * 2.0 - 1.0
-            tensor_out = tensor_out.to('cpu').to(dtype)
-            last_frame_tensor = tensor_out
-            yield tensor_out
-            count += 1
-        while count < F:
-            if last_frame_tensor is None:
-                raise RuntimeError("No frames available to pad")
-            yield last_frame_tensor
-            count += 1
-    finally:
-        try:
-            rdr.close()
-        except Exception:
-            pass
 
 def input_tensor_generator(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16):
     """
-    A generator function for the original indexable image_tensor case.
-    Produces (C,H,W) tensors in CPU dtype (same behavior as before).
+    一个生成器函数，逐帧处理并 yield 准备好的帧张量，以节省内存。
+    产出的每个张量形状为 (C, H, W)。
     """
     N0, h0, w0, _ = image_tensor.shape
     tH, tW, F = get_input_params(image_tensor, scale)
@@ -522,7 +346,7 @@ def stitch_video_tiles(
     fps, 
     quality, 
     cleanup=True,
-    chunk_size=40  # --- 新参数：每次在内存中处理的帧数 ---
+    chunk_size=40  # --- 新增参数：每次在内存中处理的帧数 ---
 ):
     if not tile_paths:
         log("No tile videos found to stitch.", message_type='error')
@@ -530,32 +354,43 @@ def stitch_video_tiles(
     
     final_W, final_H = final_dims
     
-    # Open all readers
+    # 1. 一次性打开所有视频文件
     readers = [imageio.get_reader(p) for p in tile_paths]
     
     try:
+        # 获取总帧数
         num_frames = readers[0].count_frames()
         if num_frames is None or num_frames <= 0:
             num_frames = len([_ for _ in readers[0]])
             for r in readers: r.close()
             readers = [imageio.get_reader(p) for p in tile_paths]
             
+        # 打开最终的写入器
         with imageio.get_writer(output_path, fps=fps, quality=quality) as writer:
             
+            # 2. 按 chunk_size 遍历所有帧
+            # tqdm 现在描述的是处理了多少个“块”
             for start_frame in tqdm(range(0, num_frames, chunk_size), desc="[FlashVSR] Stitching Chunks"):
                 end_frame = min(start_frame + chunk_size, num_frames)
                 current_chunk_size = end_frame - start_frame
                 
+                # 3. 为整个“块”在内存中创建画布
+                # 形状: (Frames, Height, Width, Channels)
                 chunk_canvas = np.zeros((current_chunk_size, final_H, final_W, 3), dtype=np.float32)
                 weight_canvas = np.zeros_like(chunk_canvas, dtype=np.float32)
                 
+                # 4. 遍历每个分块视频 (tile)
                 for i, reader in enumerate(readers):
+                    # 5. 一次性读取这个 tile 在当前 chunk 中的所有帧
+                    # 这是利用顺序读取的关键优化
                     try:
+                        # get_reader().iter_data() 是高效读取连续帧的方式
                         tile_chunk_frames = [
                             frame.astype(np.float32) / 255.0 
                             for idx, frame in enumerate(reader.iter_data()) 
                             if start_frame <= idx < end_frame
                         ]
+                        # 将帧列表转换为一个 NumPy 数组
                         tile_chunk_np = np.stack(tile_chunk_frames, axis=0)
                     except Exception as e:
                         log(f"Warning: Could not read chunk from tile {i}. Error: {e}", message_type='warning')
@@ -565,6 +400,7 @@ def stitch_video_tiles(
                         log(f"Warning: Tile {i} chunk has incorrect frame count. Skipping.", message_type='warning')
                         continue
                     
+                    # 6. 创建羽化蒙版 (只需要创建一次)
                     tile_H, tile_W, _ = tile_chunk_np.shape[1:]
                     ramp = np.linspace(0, 1, overlap * scale, dtype=np.float32)
                     mask = np.ones((tile_H, tile_W, 1), dtype=np.float32)
@@ -572,18 +408,23 @@ def stitch_video_tiles(
                     mask[:, -overlap*scale:, :] *= np.flip(ramp)[np.newaxis, :, np.newaxis]
                     mask[:overlap*scale, :, :] *= ramp[:, np.newaxis, np.newaxis]
                     mask[-overlap*scale:, :, :] *= np.flip(ramp)[:, np.newaxis, np.newaxis]
-                    mask_4d = mask[np.newaxis, :, :, :] # (1,H,W,C)
+                    # 扩展蒙版以匹配 chunk 的帧数维度
+                    mask_4d = mask[np.newaxis, :, :, :] # 形状: (1, H, W, C)
                     
+                    # 7. 在内存中拼接整个 chunk
                     x1_orig, y1_orig, _, _ = tile_coords[i]
                     out_y1, out_x1 = y1_orig * scale, x1_orig * scale
                     out_y2, out_x2 = out_y1 + tile_H, out_x1 + tile_W
                     
+                    # 使用 NumPy 的广播机制 (broadcasting)
                     chunk_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += tile_chunk_np * mask_4d
                     weight_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += mask_4d
                     
+                # 8. 归一化整个 chunk
                 weight_canvas[weight_canvas == 0] = 1.0
                 stitched_chunk = chunk_canvas / weight_canvas
                 
+                # 9. 将这个 chunk 的所有帧一次性写入文件
                 for frame_idx_in_chunk in range(current_chunk_size):
                     frame_uint8 = (np.clip(stitched_chunk[frame_idx_in_chunk], 0, 1) * 255).astype(np.uint8)
                     writer.append_data(frame_uint8)
@@ -591,10 +432,7 @@ def stitch_video_tiles(
     finally:
         log("Closing all tile reader instances...")
         for reader in readers:
-            try:
-                reader.close()
-            except Exception:
-                pass
+            reader.close()
             
     if cleanup:
         log("Cleaning up temporary tile files...")
@@ -669,35 +507,20 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
     if tiled_dit and (tile_overlap > tile_size / 2):
         raise ValueError('The "tile_overlap" must be less than half of "tile_size"!')
     
-    # -------------------------------
-    # Branch: streaming (tiny-long) or normal
-    # -------------------------------
-    if mode == "tiny-long":
-        fps, total_frames, h0, w0 = prepare_tensors_stream(input, dtype=dtype)
-        _fps = fps if is_video(input) else args.fps
-        frame_count = total_frames
-        # do not build big frames tensor here
-    else:
-        _frames, fps = prepare_tensors(input, dtype=dtype)
-        _fps = fps if is_video(input) else args.fps
-
-        add = next_8n5(_frames.shape[0]) - _frames.shape[0]
-        padding_frames = _frames[-1:, :, :, :].repeat(add, 1, 1, 1)
-        frames = torch.cat([_frames, padding_frames], dim=0)
-        frame_count = _frames.shape[0]
-        del _frames
-        clean_vram()
+    _frames, fps = prepare_tensors(input, dtype=dtype)
+    _fps = fps if is_video(input) else args.fps
+    
+    add = next_8n5(_frames.shape[0]) - _frames.shape[0]
+    padding_frames = _frames[-1:, :, :, :].repeat(add, 1, 1, 1)
+    frames = torch.cat([_frames, padding_frames], dim=0)
+    frame_count = _frames.shape[0]
+    del _frames
+    clean_vram()
     
     log("[FlashVSR] Preparing frames...", message_type="finish")
     
     if tiled_dit:
-        # For tiled processing we need H,W from frames (non streaming) or from streaming metadata
-        if mode == "tiny-long":
-            N = frame_count
-            H = h0
-            W = w0
-        else:
-            N, H, W, C = frames.shape
+        N, H, W, C = frames.shape
         num_aligned_frames = largest_8n1_leq(N + 4) - 4
         
         if mode == "tiny-long":
@@ -718,16 +541,13 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         pipe = init_pipeline(version, mode, _device, dtype)
         
         for i, (x1, y1, x2, y2) in enumerate(tile_coords):
+            input_tile = frames[:, y1:y2, x1:x2, :]
+                
             if mode == "tiny-long":
                 temp_name = os.path.join(local_temp, f"{i+1:05d}.mp4") 
-                # compute input params based on tile dims and total_frames
-                tile_h = y2 - y1
-                tile_w = x2 - x1
-                th, tw, F = get_input_params_from_dims(frame_count, tile_h, tile_w, scale=scale)
-                # create generator that reads the video and yields tile tensors
-                LQ_tile = tile_LQ_generator(input, x1, y1, x2, y2, scale=scale, dtype=dtype, F=F)
+                th, tw, F = get_input_params(input_tile, scale=scale)
+                LQ_tile = input_tensor_generator(input_tile, _device, scale=scale, dtype=dtype)
             else:
-                input_tile = frames[:, y1:y2, x1:x2, :]
                 LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
                 LQ_tile = LQ_tile.to(_device)
             
@@ -744,11 +564,8 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             
             temp_videos.append(temp_name)
             if mode == "tiny-long":
-                # pipeline writes per-tile files to temp_name
-                try:
-                    del LQ_tile
-                except Exception:
-                    pass
+                final_output = output_tile_gpu
+                del LQ_tile, input_tile
                 clean_vram()
                 continue
             
@@ -761,51 +578,28 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
             out_x1, out_y1 = x1 * scale, y1 * scale
             
-            # safe placement: slice to intersection sizes so shapes always match
             tile_H_scaled = processed_tile_cpu.shape[1]
             tile_W_scaled = processed_tile_cpu.shape[2]
-            canvas_H = final_output_canvas.shape[1]
-            canvas_W = final_output_canvas.shape[2]
-            y_end = min(out_y1 + tile_H_scaled, canvas_H)
-            x_end = min(out_x1 + tile_W_scaled, canvas_W)
-            h_use = y_end - out_y1
-            w_use = x_end - out_x1
-            if h_use <= 0 or w_use <= 0:
-                log(f"Warning: computed placement for tile {i+1} is out of canvas bounds; skipping.", message_type='warning')
-                del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile
-                clean_vram()
-                continue
-            
-            tile_slice = processed_tile_cpu[:, :h_use, :w_use, :]
-            mask_slice = mask_nhwc[:, :h_use, :w_use, :]
-            final_output_canvas[:, out_y1:y_end, out_x1:x_end, :] += tile_slice * mask_slice
-            weight_sum_canvas[:, out_y1:y_end, out_x1:x_end, :] += mask_slice
+            out_x2, out_y2 = out_x1 + tile_W_scaled, out_y1 + tile_H_scaled
+            final_output_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += processed_tile_cpu * mask_nhwc
+            weight_sum_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += mask_nhwc
             
             del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile
             clean_vram()
         
         if mode == "tiny-long":
-            # stitch temp tile videos -> single final file
             stitch_video_tiles(tile_paths=temp_videos, tile_coords=tile_coords, final_dims=(W * scale, H * scale),
                 scale=scale, overlap=tile_overlap, output_path=output, fps=_fps, quality=quality, cleanup=True
             )
-            try:
-                shutil.rmtree(local_temp)
-            except Exception:
-                pass
-            # for tiny-long we return None as in original flow; output file already written to `output`
-            return None, _fps
+            shutil.rmtree(local_temp)
         else:
             weight_sum_canvas[weight_sum_canvas == 0] = 1.0
             final_output = final_output_canvas / weight_sum_canvas
     else:
-        # Non-tiled path
         if mode == "tiny-long":
-            # streaming generator for whole frames
-            th, tw, F = get_input_params_from_dims(frame_count, h0, w0, scale=scale)
-            LQ = global_LQ_generator(input, scale=scale, dtype=dtype, F=F)
-        else:
             th, tw, F = get_input_params(frames, scale=scale)
+            LQ = input_tensor_generator(frames, _device, scale=scale, dtype=dtype)
+        else:
             LQ, th, tw, F = prepare_input_tensor(frames, _device, scale=scale, dtype=dtype)
             LQ = LQ.to(_device)
 
@@ -819,11 +613,7 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         )
         
         if mode == "tiny-long":
-            del pipe
-            try:
-                del LQ
-            except Exception:
-                pass
+            del pipe, LQ
             clean_vram()
             return video, _fps
         
