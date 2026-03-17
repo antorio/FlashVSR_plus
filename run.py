@@ -542,14 +542,16 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         
         for i, (x1, y1, x2, y2) in enumerate(tile_coords):
             input_tile = frames[:, y1:y2, x1:x2, :]
-                
+
             if mode == "tiny-long":
-                temp_name = os.path.join(local_temp, f"{i+1:05d}.mp4") 
+                temp_name = os.path.join(local_temp, f"{i+1:05d}.mp4")
                 th, tw, F = get_input_params(input_tile, scale=scale)
                 LQ_tile = input_tensor_generator(input_tile, _device, scale=scale, dtype=dtype)
+                pipe_output_kwargs = {"quality": 10, "output_path": temp_name}
             else:
                 LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
                 LQ_tile = LQ_tile.to(_device)
+                pipe_output_kwargs = {}
             
             if i == 0:
                 log(f"[FlashVSR] Processing {frame_count} frames...", message_type='info')
@@ -559,11 +561,11 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
                 prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
                 LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
                 topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
-                color_fix=color_fix, unload_dit=unload_dit, fps=_fps, quality=10, output_path=temp_name, tiled_dit=True
+                color_fix=color_fix, unload_dit=unload_dit, fps=_fps, tiled_dit=True, **pipe_output_kwargs
             )
-            
-            temp_videos.append(temp_name)
+
             if mode == "tiny-long":
+                temp_videos.append(temp_name)
                 final_output = output_tile_gpu
                 del LQ_tile, input_tile
                 clean_vram()
