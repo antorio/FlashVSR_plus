@@ -7,7 +7,7 @@ import argparse
 parser = argparse.ArgumentParser(description="FlashVSR+: Towards Real-Time Diffusion-Based Streaming Video Super-Resolution.")
 parser.add_argument("-i", "--input", type=str, help="Path to video file or folder of images")
 parser.add_argument("-s", "--scale", type=int, default=4, help="Upscale factor, default=4")
-parser.add_argument("-v", "--version", type=str, default="10", choices=["10", "11"], help="Model version, default=10")
+parser.add_argument("-v", "--version", type=str, default="11", choices=["10", "11"], help="Model version, default=10")
 parser.add_argument("-m", "--mode", type=str, default="tiny", choices=["tiny", "tiny-long", "full"], help="The type of pipeline to use, default=tiny")
 parser.add_argument("--tiled-vae", action="store_true", help="Enable tile decoding")
 parser.add_argument("--tiled-dit", action="store_true", help="Enable tile inference")
