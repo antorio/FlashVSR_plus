@@ -109,10 +109,7 @@ def save_video(frames, save_path, fps=30, quality=5):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     frames_np = (frames.cpu().float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
     if not str(save_path).lower().endswith((".mp4", ".mov", ".mkv", ".avi")):
-        if str(save_path).lower().endswith(".pt"):
-            save_path = os.path.splitext(save_path)[0] + ".mp4"
-        else:
-            raise ValueError(f"Unsupported video extension for save_video: {save_path}")
+        raise ValueError(f"Unsupported video extension for save_video: {save_path}")
     try:
         with imageio.get_writer(
             save_path,
@@ -128,28 +125,6 @@ def save_video(frames, save_path, fps=30, quality=5):
         raise RuntimeError(
             "Failed to save video with FFMPEG backend. Please ensure ffmpeg is installed and accessible."
         ) from e
-
-def latents_to_preview_video(latents: torch.Tensor, out_h: int, out_w: int, out_frames: int):
-    """
-    Convert latent tensor (B, C, T, H, W) to a playable RGB preview video (F, H, W, C) without VAE/TCDecoder.
-    This is only for no-decoder visualization and is not a faithful pixel-space reconstruction.
-    """
-    x = latents[0]
-    if x.shape[0] < 3:
-        x = x.repeat((3 + x.shape[0] - 1) // x.shape[0], 1, 1, 1)
-    x = x[:3]  # 3-channel pseudo-RGB
-    c = x.shape[0]
-    x = x.reshape(c, -1)
-    x_min = x.min(dim=1, keepdim=True).values
-    x_max = x.max(dim=1, keepdim=True).values
-    x = (x - x_min) / (x_max - x_min + 1e-6)
-    x = x.reshape(1, 3, latents.shape[2], latents.shape[3], latents.shape[4])
-    x = F.interpolate(x, size=(latents.shape[2], out_h, out_w), mode="trilinear", align_corners=False)
-    x = x[0].permute(1, 2, 3, 0)  # T,H,W,C
-    if x.shape[0] != out_frames:
-        idx = torch.linspace(0, x.shape[0] - 1, steps=out_frames, device=x.device).round().long()
-        x = x.index_select(0, idx)
-    return x.clamp(0, 1)
 
 def merge_video_with_audio(video_path, audio_source_path):
     temp = video_path+"temp.mp4"
@@ -518,12 +493,10 @@ def init_pipeline(version, mode, device, dtype, no_vae=False):
             pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=device, load_vae=not no_vae)
         else:
             pipe = FlashVSRTinyLongPipeline.from_model_manager(mm, device=device, load_vae=not no_vae)
-        pipe.disable_vae = no_vae
-        if not no_vae:
-            multi_scale_channels = [512, 256, 128, 128]
-            pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
-            mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device), strict=False)
-            pipe.TCDecoder.clean_mem()
+        multi_scale_channels = [512, 256, 128, 128]
+        pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
+        mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device), strict=False)
+        pipe.TCDecoder.clean_mem()
         
     if model == "FlashVSR":
         pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
@@ -542,11 +515,6 @@ def init_pipeline(version, mode, device, dtype, no_vae=False):
     return pipe
 
 def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None, no_vae=False):
-    if no_vae and mode != "tiny":
-        raise ValueError('"--no-vae" currently supports only "--mode tiny".')
-    if no_vae and tiled_dit:
-        raise ValueError('"--no-vae" does not support "--tiled-dit" yet. Please disable tiled DiT.')
-
     _device = device
     if device == "auto":
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
@@ -673,10 +641,9 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         
         if no_vae:
             latents = video.to("cpu")
-            preview = latents_to_preview_video(latents, th, tw, frame_count)
             del pipe, video, LQ
             clean_vram()
-            return preview, _fps
+            return latents, _fps
         log("[FlashVSR] Preparing frames...")
         final_output = tensor2video(video).to("cpu")
         del pipe, video, LQ
@@ -704,12 +671,10 @@ if __name__ == "__main__":
         shutil.rmtree(temp)
     os.makedirs(temp, exist_ok=True)
     name = os.path.basename(args.input.rstrip('/'))
-    final_ext = "mp4"
+    final_ext = "pt" if args.no_vae else "mp4"
     final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.{final_ext}")
     result, fps = main(args.input, args.version, args.mode, args.scale, args.color_fix, args.tiled_vae, args.tiled_dit,args.tile_size,
         args.overlap, args.unload_dit, dtype, seed=args.seed, device=args.device, quality=args.quality, output=final, no_vae=args.no_vae)
-    if str(final).lower().endswith(".pt"):
-        final = os.path.splitext(final)[0] + ".mp4"
     if args.mode != "tiny-long":
         save_video(result, final, fps=fps, quality=args.quality)
         

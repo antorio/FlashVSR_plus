@@ -460,12 +460,8 @@ class FlashVSRTinyPipeline(BasePipeline):
                 return latents
             
             # Decode
-            if getattr(self, "disable_vae", False) or self.vae is None:
-                print("[FlashVSR] Starting TCDecoder decoding...")
-                frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
-            else:
-                print("[FlashVSR] Starting VAE decoding...")
-                frames = self._decode_video(latents, **tiler_kwargs)
+            print("[FlashVSR] Starting TCDecoder decoding...")
+            frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
             
             if hasattr(self, "TCDecoder") and self.TCDecoder is not None:
                 self.TCDecoder.clean_mem()
