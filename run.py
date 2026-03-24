@@ -477,9 +477,9 @@ def init_pipeline(version, mode, device, dtype, no_vae=False):
     else:
         mm.load_models([ckpt_path])
         if mode == "tiny":
-            pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=device)
+            pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=device, load_vae=not no_vae)
         else:
-            pipe = FlashVSRTinyLongPipeline.from_model_manager(mm, device=device)
+            pipe = FlashVSRTinyLongPipeline.from_model_manager(mm, device=device, load_vae=not no_vae)
         multi_scale_channels = [512, 256, 128, 128]
         pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
         mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device), strict=False)
