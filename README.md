@@ -81,13 +81,13 @@ CLI example:
 python run.py -i ./inputs/example0.mp4 -s 4 ./
 ```
 
-Low-VRAM tiny/tiny-long example (skip VAE loading):
+No-decoder tiny example (skip VAE/TCDecoder and save raw latents):
 
 ```bash
 python run.py -i ./inputs/example0.mp4 -m tiny --no-vae -s 4 ./
 ```
 
-> `--no-vae` is only supported in `tiny` / `tiny-long` modes.
+> `--no-vae` is only supported in `tiny` mode and writes a `.pt` latent tensor output.
 
 Or use gradio web ui:  
 
