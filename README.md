@@ -80,6 +80,15 @@ CLI example:
 ```bash
 python run.py -i ./inputs/example0.mp4 -s 4 ./
 ```
+
+Low-VRAM tiny/tiny-long example (skip VAE loading):
+
+```bash
+python run.py -i ./inputs/example0.mp4 -m tiny --no-vae -s 4 ./
+```
+
+> `--no-vae` is only supported in `tiny` / `tiny-long` modes.
+
 Or use gradio web ui:  
 
 ```bash
