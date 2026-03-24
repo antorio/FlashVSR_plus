@@ -298,7 +298,8 @@ class FlashVSRTinyPipeline(BasePipeline):
         if hasattr(self.dit, "LQ_proj_in"):
             self.dit.LQ_proj_in.to('cpu')
         if not keep_vae:
-            self.TCDecoder.to('cpu')
+            if hasattr(self, "TCDecoder") and self.TCDecoder is not None:
+                self.TCDecoder.to('cpu')
 
     @torch.no_grad()
     def __call__(
@@ -368,14 +369,16 @@ class FlashVSRTinyPipeline(BasePipeline):
             self.init_cross_kv(context_tensor=self.prompt_emb_posi['context'])
         self.load_models_to_device(["dit"])
         self.dit.LQ_proj_in.to(self.device)
-        self.TCDecoder.to(self.device)
+        if hasattr(self, "TCDecoder") and self.TCDecoder is not None:
+            self.TCDecoder.to(self.device)
 
         # 清理可能存在的 LQ_proj_in cache
         if hasattr(self.dit, "LQ_proj_in"):
             self.dit.LQ_proj_in.clear_cache()
 
         latents_total = []
-        self.TCDecoder.clean_mem()
+        if hasattr(self, "TCDecoder") and self.TCDecoder is not None:
+            self.TCDecoder.clean_mem()
         LQ_pre_idx = 0
         LQ_cur_idx = 0
 
@@ -450,12 +453,18 @@ class FlashVSRTinyPipeline(BasePipeline):
                 self.offload_model(keep_vae=True)
                 
             latents = torch.cat(latents_total, dim=2)
+
+            if kwargs.get("skip_decode", False):
+                if force_offload:
+                    self.offload_model()
+                return latents
             
             # Decode
             print("[FlashVSR] Starting TCDecoder decoding...")
             frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
             
-            self.TCDecoder.clean_mem()
+            if hasattr(self, "TCDecoder") and self.TCDecoder is not None:
+                self.TCDecoder.clean_mem()
             if force_offload:
                 self.offload_model()
                 

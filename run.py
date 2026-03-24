@@ -464,7 +464,7 @@ def init_pipeline(version, mode, device, dtype, no_vae=False):
     if not os.path.exists(lq_path):
         raise RuntimeError(f'"LQ_proj_in.ckpt" does not exist! Please save it to "{model_path}"')
     tcd_path = os.path.join(model_path, "TCDecoder.ckpt")
-    if not os.path.exists(tcd_path):
+    if (not no_vae) and not os.path.exists(tcd_path):
         raise RuntimeError(f'"TCDecoder.ckpt" does not exist! Please save it to "{model_path}"')
     prompt_path = os.path.join(root, "models", "posi_prompt.pth")
     
@@ -617,7 +617,8 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
             LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
             topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
-            color_fix = color_fix, unload_dit=unload_dit, fps=_fps, output_path=output, tiled_dit=True
+            color_fix = color_fix, unload_dit=unload_dit, fps=_fps, output_path=output, tiled_dit=True,
+            skip_decode=no_vae
         )
         
         if mode == "tiny-long":
@@ -625,6 +626,11 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             clean_vram()
             return video, _fps
         
+        if no_vae:
+            latents = video.to("cpu")
+            del pipe, video, LQ
+            clean_vram()
+            return latents, _fps
         log("[FlashVSR] Preparing frames...")
         final_output = tensor2video(video).to("cpu")
         del pipe, video, LQ
@@ -652,11 +658,13 @@ if __name__ == "__main__":
         shutil.rmtree(temp)
     os.makedirs(temp, exist_ok=True)
     name = os.path.basename(args.input.rstrip('/'))
-    final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.mp4")
+    final_ext = "pt" if args.no_vae else "mp4"
+    final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.{final_ext}")
     result, fps = main(args.input, args.version, args.mode, args.scale, args.color_fix, args.tiled_vae, args.tiled_dit,args.tile_size,
         args.overlap, args.unload_dit, dtype, seed=args.seed, device=args.device, quality=args.quality, output=final, no_vae=args.no_vae)
     if args.mode != "tiny-long":
         save_video(result, final, fps=fps, quality=args.quality)
         
-    merge_video_with_audio(final, args.input)
+    if not args.no_vae:
+        merge_video_with_audio(final, args.input)
     log("[FlashVSR] Done.", message_type='finish')
