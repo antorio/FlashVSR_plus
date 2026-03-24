@@ -206,16 +206,16 @@ class FlashVSRTinyPipeline(BasePipeline):
         )
         self.enable_cpu_offload()
 
-    def fetch_models(self, model_manager: ModelManager, load_vae: bool = True):
+    def fetch_models(self, model_manager: ModelManager):
         self.dit = model_manager.fetch_model("wan_video_dit")
-        self.vae = model_manager.fetch_model("wan_video_vae") if load_vae else None
+        self.vae = model_manager.fetch_model("wan_video_vae")
 
     @staticmethod
-    def from_model_manager(model_manager: ModelManager, torch_dtype=None, device=None, use_usp=False, load_vae: bool = True):
+    def from_model_manager(model_manager: ModelManager, torch_dtype=None, device=None, use_usp=False):
         if device is None: device = model_manager.device
         if torch_dtype is None: torch_dtype = model_manager.torch_dtype
         pipe = FlashVSRTinyPipeline(device=device, torch_dtype=torch_dtype)
-        pipe.fetch_models(model_manager, load_vae=load_vae)
+        pipe.fetch_models(model_manager)
         # 可选：统一序列并行入口（此处默认关闭）
         pipe.use_unified_sequence_parallel = False
         return pipe
@@ -281,15 +281,14 @@ class FlashVSRTinyPipeline(BasePipeline):
         return frames
     
     def decode_video(self, latents, cond=None, **kwargs):
-        if getattr(self, "disable_vae", False) or self.vae is None:
-            frames = self.TCDecoder.decode_video(
-                latents.transpose(1, 2), # TCDecoder 需要 (B, F, C, H, W)
-                parallel=False,
-                show_progress_bar=False,
-                cond=cond
-            ).transpose(1, 2).mul_(2).sub_(1) # 转回 (B, C, F, H, W) 格式，范围 -1 to 1
-            return frames
-        return self._decode_video(latents, **kwargs)
+        frames = self.TCDecoder.decode_video(
+            latents.transpose(1, 2), # TCDecoder 需要 (B, F, C, H, W)
+            parallel=False, 
+            show_progress_bar=False, 
+            cond=cond
+        ).transpose(1, 2).mul_(2).sub_(1) # 转回 (B, C, F, H, W) 格式，范围 -1 to 1
+        
+        return frames
     
     def offload_model(self, keep_vae=False):
         self.dit.clear_cross_kv()
@@ -298,8 +297,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         if hasattr(self.dit, "LQ_proj_in"):
             self.dit.LQ_proj_in.to('cpu')
         if not keep_vae:
-            if hasattr(self, "TCDecoder") and self.TCDecoder is not None:
-                self.TCDecoder.to('cpu')
+            self.TCDecoder.to('cpu')
 
     @torch.no_grad()
     def __call__(
@@ -369,16 +367,14 @@ class FlashVSRTinyPipeline(BasePipeline):
             self.init_cross_kv(context_tensor=self.prompt_emb_posi['context'])
         self.load_models_to_device(["dit"])
         self.dit.LQ_proj_in.to(self.device)
-        if hasattr(self, "TCDecoder") and self.TCDecoder is not None:
-            self.TCDecoder.to(self.device)
+        self.TCDecoder.to(self.device)
 
         # 清理可能存在的 LQ_proj_in cache
         if hasattr(self.dit, "LQ_proj_in"):
             self.dit.LQ_proj_in.clear_cache()
 
         latents_total = []
-        if hasattr(self, "TCDecoder") and self.TCDecoder is not None:
-            self.TCDecoder.clean_mem()
+        self.TCDecoder.clean_mem()
         LQ_pre_idx = 0
         LQ_cur_idx = 0
 
@@ -453,18 +449,12 @@ class FlashVSRTinyPipeline(BasePipeline):
                 self.offload_model(keep_vae=True)
                 
             latents = torch.cat(latents_total, dim=2)
-
-            if kwargs.get("skip_decode", False):
-                if force_offload:
-                    self.offload_model()
-                return latents
             
             # Decode
-            print("[FlashVSR] Starting TCDecoder decoding...")
+            print("[FlashVSR] Starting VAE decoding...")
             frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
             
-            if hasattr(self, "TCDecoder") and self.TCDecoder is not None:
-                self.TCDecoder.clean_mem()
+            self.TCDecoder.clean_mem()
             if force_offload:
                 self.offload_model()
                 
