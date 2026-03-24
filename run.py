@@ -108,10 +108,23 @@ def is_video(path):
 def save_video(frames, save_path, fps=30, quality=5):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     frames_np = (frames.cpu().float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
-    w = imageio.get_writer(save_path, fps=fps, quality=quality)
-    for frame_np in tqdm(frames_np, desc=f"[FlashVSR] Saving video"):
-        w.append_data(frame_np)
-    w.close()
+    if not str(save_path).lower().endswith((".mp4", ".mov", ".mkv", ".avi")):
+        raise ValueError(f"Unsupported video extension for save_video: {save_path}")
+    try:
+        with imageio.get_writer(
+            save_path,
+            format="FFMPEG",
+            mode="I",
+            fps=fps,
+            quality=quality,
+            macro_block_size=None,
+        ) as w:
+            for frame_np in tqdm(frames_np, desc=f"[FlashVSR] Saving video"):
+                w.append_data(frame_np)
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to save video with FFMPEG backend. Please ensure ffmpeg is installed and accessible."
+        ) from e
 
 def merge_video_with_audio(video_path, audio_source_path):
     temp = video_path+"temp.mp4"
