@@ -9,7 +9,7 @@ parser.add_argument("-i", "--input", type=str, help="Path to video file or folde
 parser.add_argument("-s", "--scale", type=int, default=4, help="Upscale factor, default=4")
 parser.add_argument("-v", "--version", type=str, default="11", choices=["10", "11"], help="Model version, default=11")
 parser.add_argument("-m", "--mode", type=str, default="tiny", choices=["tiny", "tiny-long", "full"], help="The type of pipeline to use, default=tiny")
-parser.add_argument("--no-vae", action="store_true", help="Skip all decoding and return raw latents (tiny mode only)")
+parser.add_argument("--no-vae", action="store_true", help="Skip VAE/TCDecoder decode and render a lightweight latent preview video (tiny mode only)")
 parser.add_argument("--tiled-vae", action="store_true", help="Enable tile decoding")
 parser.add_argument("--tiled-dit", action="store_true", help="Enable tile inference")
 parser.add_argument("--tile-size", type=int, default=256, help="Chunk size of tile inference, default=256")
@@ -112,6 +112,28 @@ def save_video(frames, save_path, fps=30, quality=5):
     for frame_np in tqdm(frames_np, desc=f"[FlashVSR] Saving video"):
         w.append_data(frame_np)
     w.close()
+
+def latents_to_preview_video(latents: torch.Tensor, out_h: int, out_w: int, out_frames: int):
+    """
+    Convert latent tensor (C, T, H, W) to playable RGB preview video (F, H, W, C)
+    without VAE/TCDecoder decoding. This is a lightweight visualization.
+    """
+    x = latents
+    if x.shape[0] < 3:
+        x = x.repeat((3 + x.shape[0] - 1) // x.shape[0], 1, 1, 1)
+    x = x[:3]
+    c = x.shape[0]
+    x = x.reshape(c, -1)
+    x_min = x.min(dim=1, keepdim=True).values
+    x_max = x.max(dim=1, keepdim=True).values
+    x = (x - x_min) / (x_max - x_min + 1e-6)
+    x = x.reshape(1, 3, latents.shape[1], latents.shape[2], latents.shape[3])
+    x = F.interpolate(x, size=(latents.shape[1], out_h, out_w), mode="trilinear", align_corners=False)
+    x = x[0].permute(1, 2, 3, 0)  # T,H,W,C
+    if x.shape[0] != out_frames:
+        idx = torch.linspace(0, x.shape[0] - 1, steps=out_frames, device=x.device).round().long()
+        x = x.index_select(0, idx)
+    return x.clamp(0, 1)
 
 def merge_video_with_audio(video_path, audio_source_path):
     temp = video_path+"temp.mp4"
@@ -637,9 +659,11 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             return video, _fps
         
         if no_vae:
+            latents = video
+            preview = latents_to_preview_video(latents, th, tw, frame_count)
             del pipe, LQ
             clean_vram()
-            return video, _fps
+            return preview.to("cpu"), _fps
 
         log("[FlashVSR] Preparing frames...")
         final_output = tensor2video(video).to("cpu")
@@ -668,17 +692,10 @@ if __name__ == "__main__":
         shutil.rmtree(temp)
     os.makedirs(temp, exist_ok=True)
     name = os.path.basename(args.input.rstrip('/'))
-    if args.no_vae:
-        final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.pt")
-    else:
-        final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.mp4")
+    final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.mp4")
     result, fps = main(args.input, args.version, args.mode, args.scale, args.color_fix, args.tiled_vae, args.tiled_dit,args.tile_size,
         args.overlap, args.unload_dit, dtype, seed=args.seed, device=args.device, quality=args.quality, output=final, no_vae=args.no_vae)
-    if args.no_vae:
-        os.makedirs(os.path.dirname(final), exist_ok=True)
-        torch.save(result.cpu(), final)
-        log(f"[FlashVSR] Output latents saved to '{final}'", message_type='info')
-    elif args.mode != "tiny-long":
+    if args.mode != "tiny-long":
         save_video(result, final, fps=fps, quality=args.quality)
 
     if not args.no_vae:
