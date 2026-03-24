@@ -281,14 +281,15 @@ class FlashVSRTinyPipeline(BasePipeline):
         return frames
     
     def decode_video(self, latents, cond=None, **kwargs):
-        frames = self.TCDecoder.decode_video(
-            latents.transpose(1, 2), # TCDecoder 需要 (B, F, C, H, W)
-            parallel=False, 
-            show_progress_bar=False, 
-            cond=cond
-        ).transpose(1, 2).mul_(2).sub_(1) # 转回 (B, C, F, H, W) 格式，范围 -1 to 1
-        
-        return frames
+        if getattr(self, "disable_vae", False) or self.vae is None:
+            frames = self.TCDecoder.decode_video(
+                latents.transpose(1, 2), # TCDecoder 需要 (B, F, C, H, W)
+                parallel=False,
+                show_progress_bar=False,
+                cond=cond
+            ).transpose(1, 2).mul_(2).sub_(1) # 转回 (B, C, F, H, W) 格式，范围 -1 to 1
+            return frames
+        return self._decode_video(latents, **kwargs)
     
     def offload_model(self, keep_vae=False):
         self.dit.clear_cross_kv()
