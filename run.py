@@ -10,6 +10,7 @@ parser.add_argument("-s", "--scale", type=int, default=4, help="Upscale factor, 
 parser.add_argument("-v", "--version", type=str, default="11", choices=["10", "11"], help="Model version, default=11")
 parser.add_argument("-m", "--mode", type=str, default="tiny", choices=["tiny", "tiny-long", "full"], help="The type of pipeline to use, default=tiny")
 parser.add_argument("--tiled-vae", action="store_true", help="Enable tile decoding")
+parser.add_argument("--no-vae", action="store_true", help="Disable VAE dependency in tiny/tiny-long modes for decoder-side ablation")
 parser.add_argument("--tiled-dit", action="store_true", help="Enable tile inference")
 parser.add_argument("--tile-size", type=int, default=256, help="Chunk size of tile inference, default=256")
 parser.add_argument("--overlap", type=int, default=24, help="Overlap size of tile inference, default=24")
@@ -107,10 +108,45 @@ def is_video(path):
 def save_video(frames, save_path, fps=30, quality=5):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     frames_np = (frames.cpu().float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
-    w = imageio.get_writer(save_path, fps=fps, quality=quality)
-    for frame_np in tqdm(frames_np, desc=f"[FlashVSR] Saving video"):
-        w.append_data(frame_np)
-    w.close()
+    if not str(save_path).lower().endswith((".mp4", ".mov", ".mkv", ".avi")):
+        raise ValueError(f"Unsupported video extension for save_video: {save_path}")
+    try:
+        with imageio.get_writer(
+            save_path,
+            format="FFMPEG",
+            mode="I",
+            fps=fps,
+            quality=quality,
+            macro_block_size=None,
+        ) as w:
+            for frame_np in tqdm(frames_np, desc=f"[FlashVSR] Saving video"):
+                w.append_data(frame_np)
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to save video with FFMPEG backend. Please ensure ffmpeg is installed and accessible."
+        ) from e
+
+def latents_to_preview_video(latents: torch.Tensor, out_h: int, out_w: int, out_frames: int):
+    """
+    Convert latent tensor (B, C, T, H, W) to a playable RGB preview video (F, H, W, C) without VAE/TCDecoder.
+    This is only for no-decoder visualization and is not a faithful pixel-space reconstruction.
+    """
+    x = latents[0]
+    if x.shape[0] < 3:
+        x = x.repeat((3 + x.shape[0] - 1) // x.shape[0], 1, 1, 1)
+    x = x[:3]  # 3-channel pseudo-RGB
+    c = x.shape[0]
+    x = x.reshape(c, -1)
+    x_min = x.min(dim=1, keepdim=True).values
+    x_max = x.max(dim=1, keepdim=True).values
+    x = (x - x_min) / (x_max - x_min + 1e-6)
+    x = x.reshape(1, 3, latents.shape[2], latents.shape[3], latents.shape[4])
+    x = F.interpolate(x, size=(latents.shape[2], out_h, out_w), mode="trilinear", align_corners=False)
+    x = x[0].permute(1, 2, 3, 0)  # T,H,W,C
+    if x.shape[0] != out_frames:
+        idx = torch.linspace(0, x.shape[0] - 1, steps=out_frames, device=x.device).round().long()
+        x = x.index_select(0, idx)
+    return x.clamp(0, 1)
 
 def merge_video_with_audio(video_path, audio_source_path):
     temp = video_path+"temp.mp4"
@@ -442,7 +478,7 @@ def stitch_video_tiles(
             except OSError as e:
                 log(f"Could not remove temporary file '{path}': {e}", message_type='warning')
 
-def init_pipeline(version, mode, device, dtype):
+def init_pipeline(version, mode, device, dtype, no_vae=False):
     if version == "10":
         model = "FlashVSR"
     else:
@@ -455,13 +491,15 @@ def init_pipeline(version, mode, device, dtype):
     if not os.path.exists(ckpt_path):
         raise RuntimeError(f'"diffusion_pytorch_model_streaming_dmd.safetensors" does not exist! Please save it to "{model_path}"')
     vae_path = os.path.join(model_path, "Wan2.1_VAE.pth")
-    if not os.path.exists(vae_path):
+    if mode == "full" and no_vae:
+        raise ValueError('"--no-vae" is only supported in "tiny" and "tiny-long" modes.')
+    if (mode == "full" or not no_vae) and not os.path.exists(vae_path):
         raise RuntimeError(f'"Wan2.1_VAE.pth" does not exist! Please save it to "{model_path}"')
     lq_path = os.path.join(model_path, "LQ_proj_in.ckpt")
     if not os.path.exists(lq_path):
         raise RuntimeError(f'"LQ_proj_in.ckpt" does not exist! Please save it to "{model_path}"')
     tcd_path = os.path.join(model_path, "TCDecoder.ckpt")
-    if not os.path.exists(tcd_path):
+    if (not no_vae) and not os.path.exists(tcd_path):
         raise RuntimeError(f'"TCDecoder.ckpt" does not exist! Please save it to "{model_path}"')
     prompt_path = os.path.join(root, "models", "posi_prompt.pth")
     
@@ -474,13 +512,15 @@ def init_pipeline(version, mode, device, dtype):
     else:
         mm.load_models([ckpt_path])
         if mode == "tiny":
-            pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=device)
+            pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=device, load_vae=not no_vae)
         else:
-            pipe = FlashVSRTinyLongPipeline.from_model_manager(mm, device=device)
-        multi_scale_channels = [512, 256, 128, 128]
-        pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
-        mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device), strict=False)
-        pipe.TCDecoder.clean_mem()
+            pipe = FlashVSRTinyLongPipeline.from_model_manager(mm, device=device, load_vae=not no_vae)
+        pipe.disable_vae = no_vae
+        if not no_vae:
+            multi_scale_channels = [512, 256, 128, 128]
+            pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
+            mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device), strict=False)
+            pipe.TCDecoder.clean_mem()
         
     if model == "FlashVSR":
         pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
@@ -491,11 +531,19 @@ def init_pipeline(version, mode, device, dtype):
     pipe.to(device, dtype=dtype)
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
     pipe.init_cross_kv(prompt_path=prompt_path)
-    pipe.load_models_to_device(["dit","vae"])
+    if no_vae:
+        pipe.load_models_to_device(["dit"])
+    else:
+        pipe.load_models_to_device(["dit","vae"])
     
     return pipe
 
-def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None):
+def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None, no_vae=False):
+    if no_vae and mode != "tiny":
+        raise ValueError('"--no-vae" currently supports only "--mode tiny".')
+    if no_vae and tiled_dit:
+        raise ValueError('"--no-vae" does not support "--tiled-dit" yet. Please disable tiled DiT.')
+
     _device = device
     if device == "auto":
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
@@ -538,7 +586,7 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         latent_tiles_cpu = []
         temp_videos = []
         
-        pipe = init_pipeline(version, mode, _device, dtype)
+        pipe = init_pipeline(version, mode, _device, dtype, no_vae=no_vae)
         
         for i, (x1, y1, x2, y2) in enumerate(tile_coords):
             input_tile = frames[:, y1:y2, x1:x2, :]
@@ -605,13 +653,14 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             LQ, th, tw, F = prepare_input_tensor(frames, _device, scale=scale, dtype=dtype)
             LQ = LQ.to(_device)
 
-        pipe = init_pipeline(version, mode, _device, dtype)
+        pipe = init_pipeline(version, mode, _device, dtype, no_vae=no_vae)
         log(f"[FlashVSR] Processing {frame_count} frames...", message_type='info')
         video = pipe(
             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
             LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
             topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
-            color_fix = color_fix, unload_dit=unload_dit, fps=_fps, output_path=output, tiled_dit=True
+            color_fix = color_fix, unload_dit=unload_dit, fps=_fps, output_path=output, tiled_dit=True,
+            skip_decode=no_vae
         )
         
         if mode == "tiny-long":
@@ -619,6 +668,12 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             clean_vram()
             return video, _fps
         
+        if no_vae:
+            latents = video.to("cpu")
+            preview = latents_to_preview_video(latents, th, tw, frame_count)
+            del pipe, video, LQ
+            clean_vram()
+            return preview, _fps
         log("[FlashVSR] Preparing frames...")
         final_output = tensor2video(video).to("cpu")
         del pipe, video, LQ
@@ -646,11 +701,13 @@ if __name__ == "__main__":
         shutil.rmtree(temp)
     os.makedirs(temp, exist_ok=True)
     name = os.path.basename(args.input.rstrip('/'))
-    final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.mp4")
+    final_ext = "mp4"
+    final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.{final_ext}")
     result, fps = main(args.input, args.version, args.mode, args.scale, args.color_fix, args.tiled_vae, args.tiled_dit,args.tile_size,
-        args.overlap, args.unload_dit, dtype, seed=args.seed, device=args.device, quality=args.quality, output=final)
+        args.overlap, args.unload_dit, dtype, seed=args.seed, device=args.device, quality=args.quality, output=final, no_vae=args.no_vae)
     if args.mode != "tiny-long":
         save_video(result, final, fps=fps, quality=args.quality)
         
-    merge_video_with_audio(final, args.input)
+    if not args.no_vae:
+        merge_video_with_audio(final, args.input)
     log("[FlashVSR] Done.", message_type='finish')
