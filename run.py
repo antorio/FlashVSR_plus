@@ -480,12 +480,10 @@ def init_pipeline(version, mode, device, dtype, no_vae=False):
             pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=device, load_vae=not no_vae)
         else:
             pipe = FlashVSRTinyLongPipeline.from_model_manager(mm, device=device, load_vae=not no_vae)
-        pipe.disable_vae = no_vae
-        if not no_vae:
-            multi_scale_channels = [512, 256, 128, 128]
-            pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
-            mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device), strict=False)
-            pipe.TCDecoder.clean_mem()
+        multi_scale_channels = [512, 256, 128, 128]
+        pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
+        mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device), strict=False)
+        pipe.TCDecoder.clean_mem()
         
     if model == "FlashVSR":
         pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
@@ -504,11 +502,6 @@ def init_pipeline(version, mode, device, dtype, no_vae=False):
     return pipe
 
 def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None, no_vae=False):
-    if no_vae and mode != "tiny":
-        raise ValueError('"--no-vae" currently supports only "--mode tiny".')
-    if no_vae and tiled_dit:
-        raise ValueError('"--no-vae" does not support "--tiled-dit" yet. Please disable tiled DiT.')
-
     _device = device
     if device == "auto":
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
@@ -669,10 +662,7 @@ if __name__ == "__main__":
     final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.{final_ext}")
     result, fps = main(args.input, args.version, args.mode, args.scale, args.color_fix, args.tiled_vae, args.tiled_dit,args.tile_size,
         args.overlap, args.unload_dit, dtype, seed=args.seed, device=args.device, quality=args.quality, output=final, no_vae=args.no_vae)
-    if args.no_vae:
-        torch.save(result, final)
-        log(f"[FlashVSR] Saved latent tensor to {final}", message_type="finish")
-    elif args.mode != "tiny-long":
+    if args.mode != "tiny-long":
         save_video(result, final, fps=fps, quality=args.quality)
         
     if not args.no_vae:
