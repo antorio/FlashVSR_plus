@@ -113,27 +113,72 @@ def save_video(frames, save_path, fps=30, quality=5):
         w.append_data(frame_np)
     w.close()
 
-def latents_to_preview_video(latents: torch.Tensor, out_h: int, out_w: int, out_frames: int):
+def latents_to_preview_video(latents: torch.Tensor, reference_video: torch.Tensor, out_h: int, out_w: int, out_frames: int):
     """
     Convert latent tensor (C, T, H, W) to playable RGB preview video (F, H, W, C)
-    without VAE/TCDecoder decoding. This is a lightweight visualization.
+    without VAE/TCDecoder decoding.
+    Uses a per-video linear color projection fitted from latent space to
+    reference LQ frames for more natural colors than naive channel min/max.
     """
-    x = latents
-    if x.shape[0] < 3:
-        x = x.repeat((3 + x.shape[0] - 1) // x.shape[0], 1, 1, 1)
-    x = x[:3]
-    c = x.shape[0]
-    x = x.reshape(c, -1)
-    x_min = x.min(dim=1, keepdim=True).values
-    x_max = x.max(dim=1, keepdim=True).values
-    x = (x - x_min) / (x_max - x_min + 1e-6)
-    x = x.reshape(1, 3, latents.shape[1], latents.shape[2], latents.shape[3])
-    x = F.interpolate(x, size=(latents.shape[1], out_h, out_w), mode="trilinear", align_corners=False)
-    x = x[0].permute(1, 2, 3, 0)  # T,H,W,C
-    if x.shape[0] != out_frames:
-        idx = torch.linspace(0, x.shape[0] - 1, steps=out_frames, device=x.device).round().long()
-        x = x.index_select(0, idx)
-    return x.clamp(0, 1)
+    # fallback path: simple pseudo-rgb normalization
+    def _fallback():
+        x = latents
+        if x.shape[0] < 3:
+            x = x.repeat((3 + x.shape[0] - 1) // x.shape[0], 1, 1, 1)
+        x = x[:3]
+        c = x.shape[0]
+        x = x.reshape(c, -1)
+        x_min = x.min(dim=1, keepdim=True).values
+        x_max = x.max(dim=1, keepdim=True).values
+        x = (x - x_min) / (x_max - x_min + 1e-6)
+        x = x.reshape(1, 3, latents.shape[1], latents.shape[2], latents.shape[3])
+        x = F.interpolate(x, size=(latents.shape[1], out_h, out_w), mode="trilinear", align_corners=False)
+        x = x[0].permute(1, 2, 3, 0)
+        if x.shape[0] != out_frames:
+            idx = torch.linspace(0, x.shape[0] - 1, steps=out_frames, device=x.device).round().long()
+            x = x.index_select(0, idx)
+        return x.clamp(0, 1)
+
+    try:
+        # Latents: C,T,h,w -> T,h,w,C
+        lat_t = latents.permute(1, 2, 3, 0).contiguous()
+        t_lat, h_lat, w_lat, c_lat = lat_t.shape
+
+        # Reference LQ: B,C,F,H,W in [-1,1] -> F,H,W,3 in [0,1]
+        ref = ((reference_video[0].float().permute(1, 2, 3, 0) + 1.0) / 2.0).clamp(0, 1)
+        t_ref = ref.shape[0]
+        idx_t = torch.linspace(0, t_ref - 1, steps=t_lat, device=ref.device).round().long()
+        ref = ref.index_select(0, idx_t)  # temporal align to latent T
+
+        # Downsample reference to latent resolution for fitting
+        ref_low = F.interpolate(ref.permute(0, 3, 1, 2), size=(h_lat, w_lat), mode="bilinear", align_corners=False)
+        ref_low = ref_low.permute(0, 2, 3, 1).contiguous()  # T,h,w,3
+
+        # Fit linear map: latent(C) -> rgb(3), ridge regularized
+        X = lat_t.view(-1, c_lat).float()
+        Y = ref_low.view(-1, 3).float()
+        X_mean = X.mean(dim=0, keepdim=True)
+        Xc = X - X_mean
+        reg = 1e-3
+        eye = torch.eye(c_lat, device=X.device, dtype=X.dtype)
+        W = torch.linalg.solve(Xc.T @ Xc + reg * eye, Xc.T @ Y)  # (C,3)
+        pred = (Xc @ W).view(t_lat, h_lat, w_lat, 3).clamp(0, 1)
+
+        # Upsample to output size
+        pred = F.interpolate(
+            pred.permute(3, 0, 1, 2).unsqueeze(0),
+            size=(t_lat, out_h, out_w),
+            mode="trilinear",
+            align_corners=False,
+        )[0].permute(1, 2, 3, 0)  # T,H,W,3
+
+        if pred.shape[0] != out_frames:
+            idx = torch.linspace(0, pred.shape[0] - 1, steps=out_frames, device=pred.device).round().long()
+            pred = pred.index_select(0, idx)
+
+        return pred.clamp(0, 1)
+    except Exception:
+        return _fallback()
 
 def merge_video_with_audio(video_path, audio_source_path):
     temp = video_path+"temp.mp4"
@@ -660,7 +705,7 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         
         if no_vae:
             latents = video
-            preview = latents_to_preview_video(latents, th, tw, frame_count)
+            preview = latents_to_preview_video(latents, LQ, th, tw, frame_count)
             del pipe, LQ
             clean_vram()
             return preview.to("cpu"), _fps
