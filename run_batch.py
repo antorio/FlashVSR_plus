@@ -42,6 +42,9 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("-t", "--dtype", default="bf16", choices=["fp16", "bf16"])
 parser.add_argument("-d", "--device", default="auto")
 parser.add_argument("-q", "--quality", type=int, default=10)
+parser.add_argument("--fp32-rope", action="store_true",
+                    help="Hitung RoPE di float32 alih-alih float64 (jauh lebih cepat di GPU "
+                         "consumer/L4; hasil hampir identik — uji A/B dulu di klip pendek).")
 bargs = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -84,6 +87,32 @@ run.create_feather_mask = _feather_mask_no_black_border
 # PATCH 3: fps presisi float dari container (run.py membulatkan ke int,
 # yang membuat 29.97 -> 30 dan audio drift ~3.6 detik per jam).
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# PATCH 4 (opt-in, --fp32-rope): rope_apply asli meng-cast q/k ke float64 dan
+# melakukan perkalian complex128 di SETIAP block (30x) di SETIAP step.
+# Throughput FP64 di L4/GPU consumer ~1/64 dari FP32, jadi ini hot-spot nyata.
+# Versi fp32 memberi hasil yang secara praktis identik (beda numerik ~1e-6),
+# tapi tetap uji A/B pada satu chunk sebelum dipakai penuh.
+# ---------------------------------------------------------------------------
+if bargs.fp32_rope:
+    from einops import rearrange as _rearrange
+    from src.models import wan_video_dit as _dit
+
+    def _rope_apply_fp32(x, freqs, num_heads):
+        # freqs dibangun ulang tiap step, jadi konversi complex64 dilakukan per call
+        # (tensornya kecil; biayanya nol dibanding perkalian complex128 yang dihindari)
+        f32 = freqs.to(torch.complex64)
+        x = _rearrange(x, "b s (n d) -> b s n d", n=num_heads)
+        x_out = torch.view_as_complex(
+            x.to(torch.float32).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2)
+        )
+        x_out = torch.view_as_real(x_out * f32).flatten(2)
+        return x_out.to(x.dtype)
+
+    _dit.rope_apply = _rope_apply_fp32
+    run.log("[Batch] fp32 RoPE aktif.", message_type="info")
+
+
 def probe_fps(path, fallback=30.0):
     try:
         import ffmpeg
@@ -135,7 +164,9 @@ def main():
             del result
             run.clean_vram()
         except Exception as e:
-            run.log(f"[Batch] GAGAL di chunk {f}: {e}", message_type="error")
+            import traceback
+            traceback.print_exc()
+            run.log(f"[Batch] GAGAL di chunk {f}: {type(e).__name__}: {e}", message_type="error")
             run.log("[Batch] Berhenti. Jalankan ulang cell ini untuk resume dari chunk gagal.",
                     message_type="warning")
             sys.exit(2)
