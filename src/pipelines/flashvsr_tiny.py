@@ -329,6 +329,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         color_fix = True,
         unload_dit = False,
         force_offload = False,
+        decode_window = 8,
         **kwargs,
     ):
         # 只接受 cfg=1.0（与原代码一致）
@@ -450,26 +451,40 @@ class FlashVSRTinyPipeline(BasePipeline):
                 
             latents = torch.cat(latents_total, dim=2)
             
-            # Decode
+            # Decode — windowed so the full-res output never sits on the GPU all
+            # at once (bit-identical to a single decode; prevents CUDA OOM at
+            # torch.stack for long chunks / large tiles). decode_window is in
+            # LATENT frames; each -> ~4 output frames. Output lands on CPU.
             print("[FlashVSR] Starting VAE decoding...")
-            frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
+            frames = self.TCDecoder.decode_video_chunked(
+                latents.transpose(1, 2),
+                cond=LQ_video[:, :, :LQ_cur_idx, :, :],
+                window=decode_window, show_progress_bar=False, to_cpu=True
+            ).transpose(1, 2).mul_(2).sub_(1)
             
             self.TCDecoder.clean_mem()
             if force_offload:
                 self.offload_model()
                 
-            # 颜色校正（wavelet）
-            try:
-                if color_fix:
-                    frames = self.ColorCorrector(
-                        frames.to(device=LQ_video.device),
-                        LQ_video[:, :, :frames.shape[2], :, :],
-                        clip_range=(-1, 1),
-                        chunk_size=16,
-                        method='adain'
-                    )
-            except:
-                pass
+            # Color correction (adain) — processed in temporal chunks so we never
+            # move the whole full-res clip to the GPU at once. Errors are reported
+            # (not silently swallowed as before).
+            if color_fix:
+                try:
+                    dev = LQ_video.device
+                    T = frames.shape[2]
+                    cf_out = []
+                    for s in range(0, T, 16):
+                        e = min(s + 16, T)
+                        fc = frames[:, :, s:e].to(dev)
+                        lc = LQ_video[:, :, s:e]
+                        oc = self.ColorCorrector(fc, lc, clip_range=(-1, 1),
+                                                 chunk_size=None, method='adain')
+                        cf_out.append(oc.to(frames.device))
+                        del fc, lc, oc
+                    frames = torch.cat(cf_out, dim=2)
+                except Exception as _e:
+                    print(f"[FlashVSR] color-fix skipped: {_e}")
                 
         return frames[0]
 

@@ -203,9 +203,14 @@ def prepare_tensors(path: str, dtype=torch.bfloat16):
             h0, w0, _ = first_frame.shape
             
         fps_val = meta.get('fps', 30)
-        fps = int(round(fps_val)) if isinstance(fps_val, (int, float)) else 30
+        # keep fps as float: rounding 29.97 -> 30 makes audio drift ~3.6s/hour
+        fps = float(fps_val) if isinstance(fps_val, (int, float)) and fps_val > 0 else 30.0
         
-        total = meta.get('nframes', rdr.count_frames())
+        # lazy: only count_frames() (a full decode) when metadata lacks nframes,
+        # instead of always calling it as a default-argument (eager) expression.
+        total = meta.get('nframes')
+        if not total or total <= 0:
+            total = rdr.count_frames()
         if total is None or total <= 0 :
              total = len([_ for _ in rdr])
              rdr = imageio.get_reader(path)
@@ -334,7 +339,10 @@ def create_feather_mask(size, overlap):
     mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp.view(1, 1, -1, 1))
     mask[:, :, -overlap:, :] = torch.minimum(mask[:, :, -overlap:, :], ramp.flip(0).view(1, 1, -1, 1))
     
-    return mask
+    # clamp min so image-boundary pixels (covered by a single tile whose ramp
+    # reaches 0 there) don't get zero weight -> no 1px black border after
+    # normalization. Interior tile overlaps are unaffected.
+    return mask.clamp(min=1e-3)
 
 def stitch_video_tiles(
     tile_paths, 
@@ -365,6 +373,12 @@ def stitch_video_tiles(
             for r in readers: r.close()
             readers = [imageio.get_reader(p) for p in tile_paths]
             
+        # Persistent sequential iterators — one per tile. Chunks are processed in
+        # increasing order, so we just pull the next frames from each iterator.
+        # (The old code called reader.iter_data() fresh for every chunk, decoding
+        #  each tile from frame 0 every time -> O(N^2). This is O(N).)
+        iters = [r.iter_data() for r in readers]
+
         # 打开最终的写入器
         with imageio.get_writer(output_path, fps=fps, quality=quality) as writer:
             
@@ -384,14 +398,18 @@ def stitch_video_tiles(
                     # 5. 一次性读取这个 tile 在当前 chunk 中的所有帧
                     # 这是利用顺序读取的关键优化
                     try:
-                        # get_reader().iter_data() 是高效读取连续帧的方式
-                        tile_chunk_frames = [
-                            frame.astype(np.float32) / 255.0 
-                            for idx, frame in enumerate(reader.iter_data()) 
-                            if start_frame <= idx < end_frame
-                        ]
-                        # 将帧列表转换为一个 NumPy 数组
+                        # pull the next current_chunk_size frames sequentially
+                        tile_chunk_frames = []
+                        for _ in range(current_chunk_size):
+                            frame = next(iters[i])
+                            tile_chunk_frames.append(frame.astype(np.float32) / 255.0)
                         tile_chunk_np = np.stack(tile_chunk_frames, axis=0)
+                    except StopIteration:
+                        if tile_chunk_frames:
+                            tile_chunk_np = np.stack(tile_chunk_frames, axis=0)
+                        else:
+                            log(f"Warning: tile {i} ran out of frames early.", message_type='warning')
+                            continue
                     except Exception as e:
                         log(f"Warning: Could not read chunk from tile {i}. Error: {e}", message_type='warning')
                         continue
@@ -408,6 +426,9 @@ def stitch_video_tiles(
                     mask[:, -overlap*scale:, :] *= np.flip(ramp)[np.newaxis, :, np.newaxis]
                     mask[:overlap*scale, :, :] *= ramp[:, np.newaxis, np.newaxis]
                     mask[-overlap*scale:, :, :] *= np.flip(ramp)[:, np.newaxis, np.newaxis]
+                    # clamp min: image-boundary pixels (single-tile coverage) keep
+                    # their value after normalization -> no black border.
+                    mask = np.clip(mask, 1e-3, None)
                     # 扩展蒙版以匹配 chunk 的帧数维度
                     mask_4d = mask[np.newaxis, :, :, :] # 形状: (1, H, W, C)
                     

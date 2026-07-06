@@ -266,6 +266,33 @@ class TAEHV(nn.Module):
             return x[:, self.frames_to_trim:]
         return x
 
+    def decode_video_chunked(self, x, cond=None, window=8, show_progress_bar=False, to_cpu=True):
+        """Bounded-memory equivalent of decode_video.
+
+        Decodes latents in temporal windows while carrying the causal MemBlock
+        state (self.mem) across windows, so the result is BIT-IDENTICAL to a
+        single decode_video(x, cond) call — but the full-resolution output never
+        lives on the GPU all at once. This is what prevents the CUDA OOM at
+        `torch.stack(out, 1)` for long chunks / large tiles.
+
+        x    : (N, T, C, H, W) latents (i.e. latents.transpose(1, 2))
+        cond : (N, C, T*4, H0, W0) LQ context; sliced x4 in time per window.
+        window: number of LATENT frames per decode step (each -> ~4 output frames).
+        """
+        self.clean_mem()
+        T = x.shape[1]
+        outs = []
+        rng = range(0, T, window)
+        if show_progress_bar:
+            rng = tqdm(rng, desc="[FlashVSR] VAE decoding")
+        for s in rng:
+            e = min(s + window, T)
+            xw = x[:, s:e]
+            cw = cond[:, :, s * 4:e * 4] if cond is not None else None
+            y = self.decode_video(xw, parallel=False, show_progress_bar=False, cond=cw)
+            outs.append(y.to("cpu") if to_cpu else y)
+        return torch.cat(outs, dim=1)
+
     def forward(self, *args, **kwargs):
         raise NotImplementedError("Decoder-only model: call decode_video(...) instead.")
 

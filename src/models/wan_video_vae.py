@@ -562,18 +562,18 @@ class VideoVAE_(nn.Module):
             z = z / scale[1] + scale[0]
         iter_ = z.shape[2]
         x = self.conv2(z)
+        # Accumulate decoded frames on CPU so the full-res clip never sits on the
+        # GPU all at once (numerically identical; per-frame decode and the causal
+        # feat_cache are unchanged). Prevents CUDA OOM on long chunks in full mode.
+        outs = []
         for i in range(iter_):
             self._conv_idx = [0]
-            if i == 0:
-                out = self.decoder(x[:, :, i:i + 1, :, :],
-                                   feat_cache=self._feat_map,
-                                   feat_idx=self._conv_idx)
-            else:
-                out_ = self.decoder(x[:, :, i:i + 1, :, :],
-                                    feat_cache=self._feat_map,
-                                    feat_idx=self._conv_idx)
-                out = torch.cat([out, out_], 2) # may add tensor offload
-        return out
+            out_ = self.decoder(x[:, :, i:i + 1, :, :],
+                                feat_cache=self._feat_map,
+                                feat_idx=self._conv_idx)
+            outs.append(out_.to("cpu"))
+            del out_
+        return torch.cat(outs, 2)
 
     
     def stream_decode(self, z, scale):
