@@ -293,8 +293,32 @@ run_wcdiv_new = '''            weight_sum_canvas[weight_sum_canvas == 0] = 1.0
             final_output = final_output_canvas'''
 
 
+# ---------------------------------------------------------------------------
+# 8) run.py — save_video streaming (mengatasi SYSTEM-RAM OOM saat menyimpan).
+#    Baris asli memmaterialisasi SELURUH klip sebagai float32 sekaligus
+#    (480 frame 2560x1440 ~ 21GB) sebelum loop -> OOM/^C tepat sebelum
+#    "Saving video" muncul. Streaming per-frame membatasi ke ~1 frame.
+# ---------------------------------------------------------------------------
+run_save_old = '''def save_video(frames, save_path, fps=30, quality=5):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    frames_np = (frames.cpu().float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
+    w = imageio.get_writer(save_path, fps=fps, quality=quality)
+    for frame_np in tqdm(frames_np, desc=f"[FlashVSR] Saving video"):
+        w.append_data(frame_np)
+    w.close()'''
+run_save_new = '''def save_video(frames, save_path, fps=30, quality=5):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    w = imageio.get_writer(save_path, fps=fps, quality=quality)
+    # stream per-frame so the whole clip is never materialized as float32 at once
+    for i in tqdm(range(frames.shape[0]), desc=f"[FlashVSR] Saving video"):
+        fr = (frames[i].cpu().float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
+        w.append_data(fr)
+    w.close()'''
+
+
 def main():
     print("Menerapkan patch core FlashVSR+ ...")
+    patch(RUN, run_save_old, run_save_new, "run.py: save_video streaming (RAM)", "stream per-frame so the whole clip")
     patch(RUN, run_wcalloc_old, run_wcalloc_new, "run.py: weight canvas 1-frame (RAM)", "weight identik untuk tiap frame")
     patch(RUN, run_wcdiv_old, run_wcdiv_new, "run.py: pembagian canvas in-place (RAM)", "in-place, broadcast")
     patch(TCD, tcd_old, tcd_new, "TCDecoder: decode_video_chunked", "def decode_video_chunked")
